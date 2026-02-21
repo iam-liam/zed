@@ -418,10 +418,6 @@ pub enum ThreadTarget {
     #[default]
     LocalProject,
     NewWorktree,
-    ExistingWorktree {
-        path: PathBuf,
-        branch: String,
-    },
 }
 
 impl ThreadTarget {
@@ -429,7 +425,6 @@ impl ThreadTarget {
         match self {
             Self::LocalProject => "Local Project".into(),
             Self::NewWorktree => "New Worktree".into(),
-            Self::ExistingWorktree { branch, .. } => branch.clone().into(),
         }
     }
 
@@ -437,13 +432,11 @@ impl ThreadTarget {
         match self {
             Self::LocalProject => IconName::Screen,
             Self::NewWorktree => IconName::GitBranchPlus,
-            Self::ExistingWorktree { .. } => IconName::GitBranchAlt,
         }
     }
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub enum WorktreeCreationStatus {
     Creating,
     Error(SharedString),
@@ -709,30 +702,7 @@ impl AgentPanel {
                             panel.selected_agent = selected_agent;
                         }
                         if let Some(thread_target) = serialized_panel.thread_target.clone() {
-                            let is_valid = match &thread_target {
-                                ThreadTarget::LocalProject => true,
-                                ThreadTarget::NewWorktree => {
-                                    // Validity is enforced at send time
-                                    // (handle_first_send_requested), so we trust the
-                                    // serialized value here rather than checking
-                                    // repositories — repo scanning is async and may
-                                    // not have finished yet.
-                                    true
-                                }
-                                ThreadTarget::ExistingWorktree { .. } => {
-                                    // Always fall back to LocalProject on cold start to avoid
-                                    // a blocking path.exists() call on the UI thread.
-                                    false
-                                }
-                            };
-                            if is_valid {
-                                panel.thread_target = thread_target;
-                            } else {
-                                log::info!(
-                                    "deserialized thread target {:?} is no longer valid, falling back to LocalProject",
-                                    thread_target,
-                                );
-                            }
+                            panel.thread_target = thread_target;
                         }
                         cx.notify();
                     });
@@ -1924,10 +1894,8 @@ impl AgentPanel {
     }
 
     fn set_thread_target(&mut self, action: &SetThreadTarget, cx: &mut Context<Self>) {
-        if matches!(
-            action.kind,
-            ThreadTargetKind::NewWorktree | ThreadTargetKind::ExistingWorktree
-        ) && !cx.has_flag::<AgentGitWorktreesFeatureFlag>()
+        if matches!(action.kind, ThreadTargetKind::NewWorktree)
+            && !cx.has_flag::<AgentGitWorktreesFeatureFlag>()
         {
             return;
         }
@@ -1949,26 +1917,6 @@ impl AgentPanel {
                     return;
                 }
                 ThreadTarget::NewWorktree
-            }
-            ThreadTargetKind::ExistingWorktree => {
-                if is_via_collab {
-                    log::error!(
-                        "set_thread_target: cannot use ExistingWorktree in a collab project"
-                    );
-                    return;
-                }
-                let Some(path) = action.path.as_ref() else {
-                    log::error!("set_thread_target: missing path for existing_worktree");
-                    return;
-                };
-                let Some(branch) = action.branch.as_ref() else {
-                    log::error!("set_thread_target: missing branch for existing_worktree");
-                    return;
-                };
-                ThreadTarget::ExistingWorktree {
-                    path: PathBuf::from(path),
-                    branch: branch.clone(),
-                }
             }
         };
         self.thread_target = new_target;

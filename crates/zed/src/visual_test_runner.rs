@@ -545,26 +545,6 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
         }
     }
 
-    // Run Test 11: Thread target selector visual tests
-    #[cfg(feature = "visual-tests")]
-    {
-        println!("\n--- Test 11: thread_target_selector (4 variants) ---");
-        match run_thread_target_selector_visual_tests(app_state.clone(), &mut cx, update_baseline) {
-            Ok(TestResult::Passed) => {
-                println!("✓ thread_target_selector: PASSED");
-                passed += 1;
-            }
-            Ok(TestResult::BaselineUpdated(_)) => {
-                println!("✓ thread_target_selector: Baselines updated");
-                updated += 1;
-            }
-            Err(e) => {
-                eprintln!("✗ thread_target_selector: FAILED - {}", e);
-                failed += 1;
-            }
-        }
-    }
-
     // Run Test 9: Tool Permissions Settings UI visual test
     println!("\n--- Test 9: tool_permissions_settings ---");
     match run_tool_permissions_visual_tests(app_state.clone(), &mut cx, update_baseline) {
@@ -596,6 +576,26 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
         Err(e) => {
             eprintln!("✗ settings_ui_subpage_auto_open: FAILED - {}", e);
             failed += 1;
+        }
+    }
+
+    // Run Test 11: Thread target selector visual tests
+    #[cfg(feature = "visual-tests")]
+    {
+        println!("\n--- Test 11: thread_target_selector (4 variants) ---");
+        match run_thread_target_selector_visual_tests(app_state.clone(), &mut cx, update_baseline) {
+            Ok(TestResult::Passed) => {
+                println!("✓ thread_target_selector: PASSED");
+                passed += 1;
+            }
+            Ok(TestResult::BaselineUpdated(_)) => {
+                println!("✓ thread_target_selector: Baselines updated");
+                updated += 1;
+            }
+            Err(e) => {
+                eprintln!("✗ thread_target_selector: FAILED - {}", e);
+                failed += 1;
+            }
         }
     }
 
