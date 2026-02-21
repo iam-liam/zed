@@ -227,6 +227,7 @@ pub struct AcpThreadView {
     pub subagent_scroll_handles: RefCell<HashMap<agent_client_protocol::SessionId, ScrollHandle>>,
     pub edits_expanded: bool,
     pub plan_expanded: bool,
+    pub needs_first_send_interception: bool,
     pub queue_expanded: bool,
     pub editor_expanded: bool,
     pub should_be_following: bool,
@@ -422,6 +423,7 @@ impl AcpThreadView {
             subagent_scroll_handles: RefCell::new(HashMap::default()),
             edits_expanded: false,
             plan_expanded: false,
+            needs_first_send_interception: false,
             queue_expanded: true,
             editor_expanded: false,
             should_be_following: false,
@@ -696,7 +698,7 @@ impl AcpThreadView {
             }
         }
 
-        if self.thread.read(cx).entries().is_empty() {
+        if self.thread.read(cx).entries().is_empty() && self.needs_first_send_interception {
             cx.emit(AcpThreadViewEvent::FirstSendRequested {
                 text: text.to_string(),
             });

@@ -1887,6 +1887,10 @@ impl AgentPanel {
                 }
             },
         ));
+        let needs_interception = self.thread_target != ThreadTarget::LocalProject;
+        thread_view.update(cx, |view, _cx| {
+            view.needs_first_send_interception = needs_interception;
+        });
     }
 
     pub fn thread_target(&self) -> &ThreadTarget {
@@ -1920,6 +1924,19 @@ impl AgentPanel {
             }
         };
         self.thread_target = new_target;
+        if let Some(thread_view_id) = self.subscribed_thread_view_id {
+            if let ActiveView::AgentThread { server_view, .. } = &self.active_view {
+                let thread_view = server_view.read(cx).active_thread().cloned();
+                if let Some(thread_view) = thread_view {
+                    if thread_view.entity_id() == thread_view_id {
+                        let needs_interception = self.thread_target != ThreadTarget::LocalProject;
+                        thread_view.update(cx, |view, _cx| {
+                            view.needs_first_send_interception = needs_interception;
+                        });
+                    }
+                }
+            }
+        }
         self.serialize(cx);
         cx.notify();
     }
@@ -2256,28 +2273,7 @@ impl AgentPanel {
             }
 
             if let Some(err) = first_error {
-                // Rollback all successfully created worktrees
-                let mut rollback_receivers = Vec::new();
-                for (rollback_repo, rollback_path) in &repos_and_paths {
-                    if let Ok(receiver) = cx.update(|_, cx| {
-                        rollback_repo.update(cx, |repo, _cx| {
-                            repo.remove_worktree(rollback_path.clone(), true)
-                        })
-                    }) {
-                        rollback_receivers.push((rollback_path.clone(), receiver));
-                    }
-                }
-                for (path, receiver) in rollback_receivers {
-                    match receiver.await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(err)) => {
-                            log::error!("failed to rollback worktree at {}: {err}", path.display())
-                        }
-                        Err(err) => {
-                            log::error!("failed to rollback worktree at {}: {err}", path.display())
-                        }
-                    }
-                }
+                rollback_worktrees(&repos_and_paths, cx).await;
                 this.update_in(cx, |this, _window, cx| {
                     this.worktree_creation_status = Some(WorktreeCreationStatus::Error(
                         format!("Failed to create worktree: {err}").into(),
@@ -2291,20 +2287,15 @@ impl AgentPanel {
             // created worktrees so they don't remain orphaned on disk.
             let repos_for_rollback = repos_and_paths;
 
-            let setup_err: Option<anyhow::Error> = 'setup: {
+            let setup_result: Result<()> = async {
                 let mut all_paths = created_paths;
                 let has_non_git = !non_git_paths.is_empty();
                 all_paths.extend(non_git_paths.iter().cloned());
 
-                let app_state = match workspace.upgrade() {
-                    Some(workspace) => {
-                        match cx.update(|_, cx| workspace.read(cx).app_state().clone()) {
-                            Ok(app_state) => app_state,
-                            Err(err) => break 'setup Some(err),
-                        }
-                    }
-                    None => break 'setup Some(anyhow!("Workspace no longer available")),
-                };
+                let workspace = workspace
+                    .upgrade()
+                    .ok_or_else(|| anyhow!("Workspace no longer available"))?;
+                let app_state = cx.update(|_, cx| workspace.read(cx).app_state().clone())?;
 
                 let init_dock_structure = dock_structure;
                 let init: Option<
@@ -2316,24 +2307,15 @@ impl AgentPanel {
                     workspace.set_dock_structure(init_dock_structure, window, cx);
                 }));
 
-                let new_local_task = match cx.update(|_window, cx| {
+                let new_local_task = cx.update(|_window, cx| {
                     Workspace::new_local(all_paths, app_state, window_handle, None, init, false, cx)
-                }) {
-                    Ok(task) => task,
-                    Err(err) => break 'setup Some(err),
-                };
-                let (new_window_handle, new_workspace, _) = match new_local_task.await {
-                    Ok(result) => result,
-                    Err(err) => break 'setup Some(err),
-                };
+                })?;
+                let (new_window_handle, new_workspace, _) = new_local_task.await?;
 
                 // Wait for panels to finish loading before setting anything up.
-                let panels_task = match new_window_handle.update(cx, |_, _, cx| {
+                let panels_task = new_window_handle.update(cx, |_, _, cx| {
                     new_workspace.update(cx, |workspace, _cx| workspace.take_panels_task())
-                }) {
-                    Ok(task) => task,
-                    Err(err) => break 'setup Some(err),
-                };
+                })?;
                 if let Some(task) = panels_task {
                     task.await.log_err();
                 }
@@ -2345,7 +2327,7 @@ impl AgentPanel {
 
                 // Now that panels are ready, set up the workspace: open remapped files,
                 // show toasts, and submit the prompt — all before making it visible.
-                if let Err(err) = new_window_handle.update(cx, |_multi_workspace, window, cx| {
+                new_window_handle.update(cx, |_multi_workspace, window, cx| {
                     new_workspace.update(cx, |workspace, cx| {
                         if has_non_git {
                             let toast_id =
@@ -2402,44 +2384,19 @@ impl AgentPanel {
                             });
                         }
                     });
-                }) {
-                    break 'setup Some(err);
-                }
+                })?;
 
                 // Everything is set up — now activate the workspace to make it visible.
-                if let Err(err) = new_window_handle.update(cx, |multi_workspace, _window, cx| {
+                new_window_handle.update(cx, |multi_workspace, _window, cx| {
                     multi_workspace.activate(new_workspace.clone(), cx);
-                }) {
-                    break 'setup Some(err);
-                }
+                })?;
 
-                None
-            };
+                Ok(())
+            }
+            .await;
 
-            if let Some(err) = setup_err {
-                // Post-creation setup failed — rollback all created worktrees
-                // so they don't remain orphaned on disk.
-                let mut rollback_receivers = Vec::new();
-                for (rollback_repo, rollback_path) in &repos_for_rollback {
-                    if let Ok(receiver) = cx.update(|_, cx| {
-                        rollback_repo.update(cx, |repo, _cx| {
-                            repo.remove_worktree(rollback_path.clone(), true)
-                        })
-                    }) {
-                        rollback_receivers.push((rollback_path.clone(), receiver));
-                    }
-                }
-                for (path, receiver) in rollback_receivers {
-                    match receiver.await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => {
-                            log::error!("failed to rollback worktree at {}: {e}", path.display())
-                        }
-                        Err(e) => {
-                            log::error!("failed to rollback worktree at {}: {e}", path.display())
-                        }
-                    }
-                }
+            if let Err(err) = setup_result {
+                rollback_worktrees(&repos_for_rollback, cx).await;
                 this.update_in(cx, |this, _window, cx| {
                     this.worktree_creation_status = Some(WorktreeCreationStatus::Error(
                         format!("Failed to set up new workspace: {err}").into(),
@@ -2462,6 +2419,29 @@ impl AgentPanel {
         self._worktree_creation_task = Some(cx.foreground_executor().spawn(async move {
             task.await.log_err();
         }));
+    }
+}
+
+/// Rolls back successfully-created worktrees by removing them with force.
+/// Logs errors but does not propagate them (best-effort cleanup).
+async fn rollback_worktrees(
+    repos_and_paths: &[(Entity<project::git_store::Repository>, PathBuf)],
+    cx: &mut AsyncWindowContext,
+) {
+    let mut rollback_receivers = Vec::new();
+    for (repo, path) in repos_and_paths {
+        if let Ok(receiver) =
+            cx.update(|_, cx| repo.update(cx, |repo, _cx| repo.remove_worktree(path.clone(), true)))
+        {
+            rollback_receivers.push((path.clone(), receiver));
+        }
+    }
+    for (path, receiver) in rollback_receivers {
+        match receiver.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => log::error!("failed to rollback worktree at {}: {e}", path.display()),
+            Err(e) => log::error!("failed to rollback worktree at {}: {e}", path.display()),
+        }
     }
 }
 
@@ -2547,10 +2527,10 @@ impl Panel for AgentPanel {
     fn set_active(&mut self, active: bool, window: &mut Window, cx: &mut Context<Self>) {
         if active
             && matches!(self.active_view, ActiveView::Uninitialized)
-            // TODO: When worktree creation is fully implemented, the completion
-            // path must either call new_agent_thread directly or re-trigger
-            // set_active, because this guard suppresses thread creation with no
-            // automatic recovery.
+            // Don't auto-create a thread while a worktree is being created —
+            // the creation flow will set up the thread in the new workspace.
+            // This only blocks `Creating`; an `Error` status won't prevent
+            // thread creation on the next activation.
             && !matches!(
                 self.worktree_creation_status,
                 Some(WorktreeCreationStatus::Creating)
