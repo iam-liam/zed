@@ -642,12 +642,6 @@ impl AcpThreadView {
 
         let message_editor = self.message_editor.clone();
 
-        if self.thread.read(cx).entries().is_empty() && !message_editor.read(cx).is_empty(cx) {
-            let text = message_editor.read(cx).text(cx);
-            cx.emit(AcpThreadViewEvent::FirstSendRequested { text });
-            return;
-        }
-
         let is_editor_empty = message_editor.read(cx).is_empty(cx);
         let is_generating = thread.read(cx).status() != ThreadStatus::Idle;
 
@@ -700,6 +694,13 @@ impl AcpThreadView {
                 cx.notify();
                 return;
             }
+        }
+
+        if self.thread.read(cx).entries().is_empty() {
+            cx.emit(AcpThreadViewEvent::FirstSendRequested {
+                text: text.to_string(),
+            });
+            return;
         }
 
         self.send_impl(message_editor, window, cx)

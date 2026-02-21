@@ -58,8 +58,9 @@ use extension_host::ExtensionStore;
 use fs::Fs;
 use gpui::{
     Action, Animation, AnimationExt, AnyElement, App, AsyncWindowContext, ClipboardItem, Corner,
-    DismissEvent, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable, KeyContext, Pixels,
-    Subscription, Task, UpdateGlobal, WeakEntity, prelude::*, pulsating_between,
+    DismissEvent, Entity, EntityId, EventEmitter, ExternalPaths, FocusHandle, Focusable,
+    KeyContext, Pixels, Subscription, Task, UpdateGlobal, WeakEntity, prelude::*,
+    pulsating_between,
 };
 use language::LanguageRegistry;
 use language_model::{ConfigurationError, LanguageModelRegistry};
@@ -581,6 +582,7 @@ pub struct AgentPanel {
     selected_agent: AgentType,
     thread_target: ThreadTarget,
     worktree_creation_status: Option<WorktreeCreationStatus>,
+    subscribed_thread_view_id: Option<EntityId>,
     _thread_view_subscription: Option<Subscription>,
     _worktree_creation_task: Option<Task<()>>,
     show_trust_workspace_message: bool,
@@ -710,9 +712,12 @@ impl AgentPanel {
                             let is_valid = match &thread_target {
                                 ThreadTarget::LocalProject => true,
                                 ThreadTarget::NewWorktree => {
-                                    let project = panel.project.read(cx);
-                                    !project.is_via_collab()
-                                        && !project.repositories(cx).is_empty()
+                                    // Validity is enforced at send time
+                                    // (handle_first_send_requested), so we trust the
+                                    // serialized value here rather than checking
+                                    // repositories — repo scanning is async and may
+                                    // not have finished yet.
+                                    true
                                 }
                                 ThreadTarget::ExistingWorktree { .. } => {
                                     // Always fall back to LocalProject on cold start to avoid
@@ -915,6 +920,7 @@ impl AgentPanel {
             selected_agent: AgentType::default(),
             thread_target: ThreadTarget::default(),
             worktree_creation_status: None,
+            subscribed_thread_view_id: None,
             _thread_view_subscription: None,
             _worktree_creation_task: None,
             show_trust_workspace_message: false,
@@ -1147,7 +1153,7 @@ impl AgentPanel {
 
             let server = ext_agent.server(fs, thread_store);
             this.update_in(cx, |agent_panel, window, cx| {
-                agent_panel._external_thread(
+                agent_panel.external_thread_impl(
                     server,
                     resume_thread,
                     initial_content,
@@ -1754,24 +1760,25 @@ impl AgentPanel {
             self.active_view = new_view;
         }
 
-        self._active_view_observation = match &self.active_view {
-            ActiveView::AgentThread { server_view } => {
-                self._thread_view_subscription =
-                    Self::subscribe_to_active_thread_view(&server_view, window, cx);
-                Some(
-                    cx.observe_in(server_view, window, |this, server_view, window, cx| {
-                        this._thread_view_subscription =
-                            Self::subscribe_to_active_thread_view(&server_view, window, cx);
-                        cx.emit(AgentPanelEvent::ActiveViewChanged);
-                        this.serialize(cx);
-                        cx.notify();
-                    }),
-                )
-            }
-            _ => {
-                self._thread_view_subscription = None;
-                None
-            }
+        let active_server_view = match &self.active_view {
+            ActiveView::AgentThread { server_view } => Some(server_view.clone()),
+            _ => None,
+        };
+
+        self._active_view_observation = if let Some(server_view) = active_server_view {
+            self.update_thread_view_subscription(&server_view, window, cx);
+            Some(
+                cx.observe_in(&server_view, window, |this, server_view, window, cx| {
+                    this.update_thread_view_subscription(&server_view, window, cx);
+                    cx.emit(AgentPanelEvent::ActiveViewChanged);
+                    this.serialize(cx);
+                    cx.notify();
+                }),
+            )
+        } else {
+            self.subscribed_thread_view_id = None;
+            self._thread_view_subscription = None;
+            None
         };
 
         let is_in_agent_history = matches!(
@@ -1885,22 +1892,31 @@ impl AgentPanel {
         self.selected_agent.clone()
     }
 
-    fn subscribe_to_active_thread_view(
+    fn update_thread_view_subscription(
+        &mut self,
         server_view: &Entity<AcpServerView>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Option<Subscription> {
-        server_view.read(cx).active_thread().cloned().map(|tv| {
-            cx.subscribe_in(
-                &tv,
-                window,
-                |this, view, event: &AcpThreadViewEvent, window, cx| match event {
-                    AcpThreadViewEvent::FirstSendRequested { text } => {
-                        this.handle_first_send_requested(view.clone(), text.clone(), window, cx);
-                    }
-                },
-            )
-        })
+    ) {
+        let Some(thread_view) = server_view.read(cx).active_thread().cloned() else {
+            self.subscribed_thread_view_id = None;
+            self._thread_view_subscription = None;
+            return;
+        };
+        let new_id = thread_view.entity_id();
+        if self.subscribed_thread_view_id == Some(new_id) {
+            return;
+        }
+        self.subscribed_thread_view_id = Some(new_id);
+        self._thread_view_subscription = Some(cx.subscribe_in(
+            &thread_view,
+            window,
+            |this, view, event: &AcpThreadViewEvent, window, cx| match event {
+                AcpThreadViewEvent::FirstSendRequested { text } => {
+                    this.handle_first_send_requested(view.clone(), text.clone(), window, cx);
+                }
+            },
+        ));
     }
 
     pub fn thread_target(&self) -> &ThreadTarget {
@@ -2072,7 +2088,7 @@ impl AgentPanel {
         self.external_thread(Some(agent), Some(thread), None, window, cx);
     }
 
-    pub(crate) fn _external_thread(
+    pub(crate) fn external_thread_impl(
         &mut self,
         server: Rc<dyn AgentServer>,
         resume_thread: Option<AgentSessionInfo>,
@@ -2323,121 +2339,168 @@ impl AgentPanel {
                 return anyhow::Ok(());
             }
 
-            // Collect all paths for the new workspace: new worktree paths + non-git paths as-is
-            let mut all_paths = created_paths;
-            let has_non_git = !non_git_paths.is_empty();
-            all_paths.extend(non_git_paths.iter().cloned());
+            // Post-creation setup. If any step fails, we need to rollback the
+            // created worktrees so they don't remain orphaned on disk.
+            let repos_for_rollback = repos_and_paths;
 
-            // Open the new workspace in the current window's sidebar
-            let app_state = match workspace.upgrade() {
-                Some(workspace) => cx.update(|_, cx| workspace.read(cx).app_state().clone())?,
-                None => {
-                    this.update_in(cx, |this, _window, cx| {
-                        this.worktree_creation_status = Some(WorktreeCreationStatus::Error(
-                            "Workspace no longer available".into(),
-                        ));
-                        cx.notify();
-                    })?;
-                    return anyhow::Ok(());
-                }
-            };
+            let setup_err: Option<anyhow::Error> = 'setup: {
+                let mut all_paths = created_paths;
+                let has_non_git = !non_git_paths.is_empty();
+                all_paths.extend(non_git_paths.iter().cloned());
 
-            let init_dock_structure = dock_structure;
-            let init: Option<
-                Box<dyn FnOnce(&mut Workspace, &mut Window, &mut gpui::Context<Workspace>) + Send>,
-            > = Some(Box::new(move |workspace, window, cx| {
-                workspace.set_dock_structure(init_dock_structure, window, cx);
-            }));
+                let app_state = match workspace.upgrade() {
+                    Some(workspace) => {
+                        match cx.update(|_, cx| workspace.read(cx).app_state().clone()) {
+                            Ok(app_state) => app_state,
+                            Err(err) => break 'setup Some(err),
+                        }
+                    }
+                    None => break 'setup Some(anyhow!("Workspace no longer available")),
+                };
 
-            let (new_window_handle, _) = cx
-                .update(|_window, cx| {
+                let init_dock_structure = dock_structure;
+                let init: Option<
+                    Box<
+                        dyn FnOnce(&mut Workspace, &mut Window, &mut gpui::Context<Workspace>)
+                            + Send,
+                    >,
+                > = Some(Box::new(move |workspace, window, cx| {
+                    workspace.set_dock_structure(init_dock_structure, window, cx);
+                }));
+
+                let new_local_task = match cx.update(|_window, cx| {
                     Workspace::new_local(all_paths, app_state, window_handle, None, init, false, cx)
-                })?
-                .await?;
+                }) {
+                    Ok(task) => task,
+                    Err(err) => break 'setup Some(err),
+                };
+                let (new_window_handle, new_workspace, _) = match new_local_task.await {
+                    Ok(result) => result,
+                    Err(err) => break 'setup Some(err),
+                };
 
-            // The new workspace was added to the MultiWorkspace but NOT activated.
-            // Retrieve the Entity<Workspace> for it.
-            let new_workspace = new_window_handle.update(cx, |multi_workspace, _window, _cx| {
-                let workspaces = multi_workspace.workspaces();
-                workspaces.last().cloned()
-            })?;
+                // Wait for panels to finish loading before setting anything up.
+                let panels_task = match new_window_handle.update(cx, |_, _, cx| {
+                    new_workspace.update(cx, |workspace, _cx| workspace.take_panels_task())
+                }) {
+                    Ok(task) => task,
+                    Err(err) => break 'setup Some(err),
+                };
+                if let Some(task) = panels_task {
+                    task.await.log_err();
+                }
 
-            let Some(new_workspace) = new_workspace else {
-                anyhow::bail!("New workspace was not added to MultiWorkspace");
-            };
+                let initial_content = AgentInitialContent::ContentBlock {
+                    blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(text))],
+                    auto_submit: true,
+                };
 
-            // Wait for panels to finish loading before setting anything up.
-            let panels_task = new_window_handle.update(cx, |_, _, cx| {
-                new_workspace.update(cx, |workspace, _cx| workspace.take_panels_task())
-            })?;
-            if let Some(task) = panels_task {
-                task.await.log_err();
-            }
-
-            let initial_content = AgentInitialContent::ContentBlock {
-                blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(text))],
-                auto_submit: true,
-            };
-
-            // Now that panels are ready, set up the workspace: open remapped files,
-            // show toasts, and submit the prompt — all before making it visible.
-            new_window_handle.update(cx, |_multi_workspace, window, cx| {
-                new_workspace.update(cx, |workspace, cx| {
-                    if has_non_git {
-                        let toast_id =
-                            workspace::notifications::NotificationId::unique::<AgentPanel>();
-                        workspace.show_toast(
-                            workspace::Toast::new(
-                                toast_id,
-                                "Some project folders are not git repositories. \
-                                 They were included as-is without creating a worktree.",
-                            ),
-                            cx,
-                        );
-                    }
-
-                    let remapped_paths: Vec<PathBuf> = open_file_paths
-                        .iter()
-                        .filter_map(|original_path| {
-                            for (old_root, new_root) in &path_remapping {
-                                if let Ok(relative) = original_path.strip_prefix(old_root) {
-                                    return Some(new_root.join(relative));
-                                }
-                            }
-                            for non_git in &non_git_paths {
-                                if original_path.starts_with(non_git) {
-                                    return Some(original_path.clone());
-                                }
-                            }
-                            None
-                        })
-                        .collect();
-
-                    if !remapped_paths.is_empty() {
-                        workspace
-                            .open_paths(
-                                remapped_paths,
-                                workspace::OpenOptions::default(),
-                                None,
-                                window,
+                // Now that panels are ready, set up the workspace: open remapped files,
+                // show toasts, and submit the prompt — all before making it visible.
+                if let Err(err) = new_window_handle.update(cx, |_multi_workspace, window, cx| {
+                    new_workspace.update(cx, |workspace, cx| {
+                        if has_non_git {
+                            let toast_id =
+                                workspace::notifications::NotificationId::unique::<AgentPanel>();
+                            workspace.show_toast(
+                                workspace::Toast::new(
+                                    toast_id,
+                                    "Some project folders are not git repositories. \
+                                         They were included as-is without creating a worktree.",
+                                ),
                                 cx,
-                            )
-                            .detach();
-                    }
+                            );
+                        }
 
-                    workspace.focus_panel::<AgentPanel>(window, cx);
-                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
-                        panel.update(cx, |panel, cx| {
-                            panel.external_thread(None, None, Some(initial_content), window, cx);
-                        });
-                    }
-                });
-            })?;
+                        let remapped_paths: Vec<PathBuf> = open_file_paths
+                            .iter()
+                            .filter_map(|original_path| {
+                                for (old_root, new_root) in &path_remapping {
+                                    if let Ok(relative) = original_path.strip_prefix(old_root) {
+                                        return Some(new_root.join(relative));
+                                    }
+                                }
+                                for non_git in &non_git_paths {
+                                    if original_path.starts_with(non_git) {
+                                        return Some(original_path.clone());
+                                    }
+                                }
+                                None
+                            })
+                            .collect();
 
-            // Everything is set up — now activate the workspace to make it visible.
-            new_window_handle.update(cx, |multi_workspace, _window, cx| {
-                multi_workspace.activate(new_workspace.clone(), cx);
-            })?;
+                        if !remapped_paths.is_empty() {
+                            workspace
+                                .open_paths(
+                                    remapped_paths,
+                                    workspace::OpenOptions::default(),
+                                    None,
+                                    window,
+                                    cx,
+                                )
+                                .detach();
+                        }
+
+                        workspace.focus_panel::<AgentPanel>(window, cx);
+                        if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                            panel.update(cx, |panel, cx| {
+                                panel.external_thread(
+                                    None,
+                                    None,
+                                    Some(initial_content),
+                                    window,
+                                    cx,
+                                );
+                            });
+                        }
+                    });
+                }) {
+                    break 'setup Some(err);
+                }
+
+                // Everything is set up — now activate the workspace to make it visible.
+                if let Err(err) = new_window_handle.update(cx, |multi_workspace, _window, cx| {
+                    multi_workspace.activate(new_workspace.clone(), cx);
+                }) {
+                    break 'setup Some(err);
+                }
+
+                None
+            };
+
+            if let Some(err) = setup_err {
+                // Post-creation setup failed — rollback all created worktrees
+                // so they don't remain orphaned on disk.
+                let mut rollback_receivers = Vec::new();
+                for (rollback_repo, rollback_path) in &repos_for_rollback {
+                    if let Ok(receiver) = cx.update(|_, cx| {
+                        rollback_repo.update(cx, |repo, _cx| {
+                            repo.remove_worktree(rollback_path.clone(), true)
+                        })
+                    }) {
+                        rollback_receivers.push((rollback_path.clone(), receiver));
+                    }
+                }
+                for (path, receiver) in rollback_receivers {
+                    match receiver.await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            log::error!("failed to rollback worktree at {}: {e}", path.display())
+                        }
+                        Err(e) => {
+                            log::error!("failed to rollback worktree at {}: {e}", path.display())
+                        }
+                    }
+                }
+                this.update_in(cx, |this, _window, cx| {
+                    this.worktree_creation_status = Some(WorktreeCreationStatus::Error(
+                        format!("Failed to set up new workspace: {err}").into(),
+                    ));
+                    cx.notify();
+                })
+                .log_err();
+                return anyhow::Ok(());
+            }
 
             // Clear the creation status on the original panel
             this.update_in(cx, |this, _window, cx| {
@@ -4168,7 +4231,7 @@ impl AgentPanel {
             name: server.name(),
         };
 
-        self._external_thread(
+        self.external_thread_impl(
             server, None, None, workspace, project, ext_agent, window, cx,
         );
     }

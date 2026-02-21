@@ -30,8 +30,11 @@ fn thread_title(entry: &AgentSessionInfo) -> &SharedString {
 fn format_relative_time(timestamp: DateTime<Utc>) -> String {
     let now = Utc::now();
     let duration = now.signed_duration_since(timestamp);
+    if duration.num_seconds() <= 0 {
+        return "Just now".to_string();
+    }
     if duration.num_days() > 0 {
-        format!("{}d", duration.num_days())
+        format!("{}d ago", duration.num_days())
     } else if duration.num_hours() > 0 {
         format!("{}h ago", duration.num_hours())
     } else if duration.num_minutes() > 0 {

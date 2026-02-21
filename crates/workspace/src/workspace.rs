@@ -624,7 +624,7 @@ fn prompt_and_open_paths(app_state: Arc<AppState>, options: PathPromptOptions, c
     } else {
         let task = Workspace::new_local(Vec::new(), app_state.clone(), None, None, None, true, cx);
         cx.spawn(async move |cx| {
-            let (window, _) = task.await?;
+            let (window, _, _) = task.await?;
             window.update(cx, |multi_workspace, window, cx| {
                 window.activate_window();
                 let workspace = multi_workspace.workspace().clone();
@@ -1728,6 +1728,7 @@ impl Workspace {
     ) -> Task<
         anyhow::Result<(
             WindowHandle<MultiWorkspace>,
+            Entity<Workspace>,
             Vec<Option<anyhow::Result<Box<dyn ItemHandle>>>>,
         )>,
     > {
@@ -1970,7 +1971,7 @@ impl Workspace {
                     });
                 })
                 .log_err();
-            Ok((window, opened_items))
+            Ok((window, workspace, opened_items))
         })
     }
 
@@ -2009,27 +2010,33 @@ impl Workspace {
         [&self.left_dock, &self.bottom_dock, &self.right_dock]
     }
 
-    pub fn capture_dock_state(&self, _window: &Window, cx: &App) -> DockStructure {
+    pub fn capture_dock_state(&self, window: &Window, cx: &App) -> DockStructure {
         let left_dock = self.left_dock.read(cx);
         let left_visible = left_dock.is_open();
         let left_active_panel = left_dock
             .active_panel()
             .map(|panel| panel.persistent_name().to_string());
-        let left_dock_zoom = self.zoomed_position == Some(DockPosition::Left);
+        let left_dock_zoom = left_dock
+            .active_panel()
+            .is_some_and(|panel| panel.is_zoomed(window, cx));
 
         let right_dock = self.right_dock.read(cx);
         let right_visible = right_dock.is_open();
         let right_active_panel = right_dock
             .active_panel()
             .map(|panel| panel.persistent_name().to_string());
-        let right_dock_zoom = self.zoomed_position == Some(DockPosition::Right);
+        let right_dock_zoom = right_dock
+            .active_panel()
+            .is_some_and(|panel| panel.is_zoomed(window, cx));
 
         let bottom_dock = self.bottom_dock.read(cx);
         let bottom_visible = bottom_dock.is_open();
         let bottom_active_panel = bottom_dock
             .active_panel()
             .map(|panel| panel.persistent_name().to_string());
-        let bottom_dock_zoom = self.zoomed_position == Some(DockPosition::Bottom);
+        let bottom_dock_zoom = bottom_dock
+            .active_panel()
+            .is_some_and(|panel| panel.is_zoomed(window, cx));
 
         DockStructure {
             left: DockData {
@@ -2659,7 +2666,7 @@ impl Workspace {
                 cx,
             );
             cx.spawn_in(window, async move |_vh, cx| {
-                let (multi_workspace_window, _) = task.await?;
+                let (multi_workspace_window, _, _) = task.await?;
                 multi_workspace_window.update(cx, |multi_workspace, window, cx| {
                     let workspace = multi_workspace.workspace().clone();
                     workspace.update(cx, |workspace, cx| callback(workspace, window, cx))
@@ -2697,7 +2704,7 @@ impl Workspace {
                 cx,
             );
             cx.spawn_in(window, async move |_vh, cx| {
-                let (multi_workspace_window, _) = task.await?;
+                let (multi_workspace_window, _, _) = task.await?;
                 multi_workspace_window.update(cx, |multi_workspace, window, cx| {
                     let workspace = multi_workspace.workspace().clone();
                     workspace.update(cx, |workspace, cx| callback(workspace, window, cx))
@@ -8019,7 +8026,7 @@ pub async fn restore_multiworkspace(
         cx.update(|cx| open_workspace_by_id(first.workspace_id, app_state.clone(), None, cx))
             .await?
     } else {
-        let (window, _items) = cx
+        let (window, _, _items) = cx
             .update(|cx| {
                 Workspace::new_local(
                     first.paths.paths().to_vec(),
@@ -8327,7 +8334,7 @@ pub fn join_channel(
         let mut active_window = requesting_window.or_else(|| activate_any_workspace_window(cx));
         if active_window.is_none() {
             // no open workspaces, make one to show the error in (blergh)
-            let (window_handle, _) = cx
+            let (window_handle, _, _) = cx
                 .update(|cx| {
                     Workspace::new_local(
                         vec![],
@@ -8802,7 +8809,7 @@ pub fn open_paths(
                 })
                 .await;
 
-            if let Ok((ref window_handle, _)) = result {
+            if let Ok((ref window_handle, _, _)) = result {
                 window_handle
                     .update(cx, |_, window, _cx| {
                         window.activate_window();
@@ -8810,7 +8817,7 @@ pub fn open_paths(
                     .log_err();
             }
 
-            result
+            result.map(|(window, _, items)| (window, items))
         };
 
         #[cfg(target_os = "windows")]
@@ -8864,7 +8871,7 @@ pub fn open_new(
         cx,
     );
     cx.spawn(async move |cx| {
-        let (window, _opened_paths) = task.await?;
+        let (window, _, _opened_paths) = task.await?;
         window
             .update(cx, |_, window, _cx| {
                 window.activate_window();
