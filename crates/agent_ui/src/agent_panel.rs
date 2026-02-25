@@ -4511,7 +4511,10 @@ mod tests {
     async fn test_thread_target_serialization_round_trip(cx: &mut TestAppContext) {
         init_test(cx);
         cx.update(|cx| {
-            cx.update_flags(true, vec!["agent-v2".to_string()]);
+            cx.update_flags(
+                true,
+                vec!["agent-v2".to_string(), "agent-git-worktrees".to_string()],
+            );
             agent::ThreadStore::init_global(cx);
             language_model::LanguageModelRegistry::test(cx);
         });
