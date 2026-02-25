@@ -2308,7 +2308,6 @@ impl AgentPanel {
 
             let setup_result: Result<()> = async {
                 let mut all_paths = created_paths;
-                let has_non_git = !non_git_paths.is_empty();
                 all_paths.extend(non_git_paths.iter().cloned());
 
                 let workspace = workspace
@@ -2348,34 +2347,12 @@ impl AgentPanel {
                 // show toasts, and submit the prompt — all before making it visible.
                 new_window_handle.update(cx, |_multi_workspace, window, cx| {
                     new_workspace.update(cx, |workspace, cx| {
-                        if has_non_git {
-                            let mut parts: Vec<String> = Vec::new();
-                            if !untrusted_names.is_empty() {
-                                let names = untrusted_names.join(", ");
-                                if untrusted_names.len() == 1 {
-                                    parts.push(format!("{names} is not trusted"));
-                                } else {
-                                    parts.push(format!("{names} are not trusted"));
-                                }
-                            }
-                            if !non_git_names.is_empty() {
-                                let names = non_git_names.join(", ");
-                                if non_git_names.len() == 1 {
-                                    parts.push(format!("{names} is not a git repository"));
-                                } else {
-                                    parts.push(format!("{names} are not git repositories"));
-                                }
-                            }
-                            if !parts.is_empty() {
-                                let message = format!(
-                                    "{}. Included as-is without creating a worktree.",
-                                    parts.join(", and "),
-                                );
-                                let toast_id = workspace::notifications::NotificationId::unique::<
-                                    AgentPanel,
-                                >();
-                                workspace.show_toast(workspace::Toast::new(toast_id, message), cx);
-                            }
+                        if let Some(message) =
+                            skipped_folders_toast_message(&untrusted_names, &non_git_names)
+                        {
+                            let toast_id =
+                                workspace::notifications::NotificationId::unique::<AgentPanel>();
+                            workspace.show_toast(workspace::Toast::new(toast_id, message), cx);
                         }
 
                         let remapped_paths: Vec<PathBuf> = open_file_paths
@@ -4259,6 +4236,36 @@ impl AgentPanel {
     }
 }
 
+fn skipped_folders_toast_message(
+    untrusted_names: &[String],
+    non_git_names: &[String],
+) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if !untrusted_names.is_empty() {
+        let names = untrusted_names.join(", ");
+        if untrusted_names.len() == 1 {
+            parts.push(format!("{names} is not trusted"));
+        } else {
+            parts.push(format!("{names} are not trusted"));
+        }
+    }
+    if !non_git_names.is_empty() {
+        let names = non_git_names.join(", ");
+        if non_git_names.len() == 1 {
+            parts.push(format!("{names} is not a git repository"));
+        } else {
+            parts.push(format!("{names} are not git repositories"));
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{}. Included as-is without creating a worktree.",
+        parts.join(", and "),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4734,6 +4741,318 @@ mod tests {
             assert!(
                 !matches!(panel.active_view, ActiveView::Uninitialized),
                 "panel should transition out of Uninitialized once worktree creation is cleared"
+            );
+        });
+    }
+
+    #[test]
+    fn test_skipped_folders_toast_one_untrusted() {
+        let message =
+            skipped_folders_toast_message(&["roc".into()], &[]).expect("should produce a message");
+        assert_eq!(
+            message,
+            "roc is not trusted. Included as-is without creating a worktree."
+        );
+    }
+
+    #[test]
+    fn test_skipped_folders_toast_multiple_untrusted() {
+        let message = skipped_folders_toast_message(&["roc".into(), "basic-cli".into()], &[])
+            .expect("should produce a message");
+        assert_eq!(
+            message,
+            "roc, basic-cli are not trusted. Included as-is without creating a worktree."
+        );
+    }
+
+    #[test]
+    fn test_skipped_folders_toast_one_non_git() {
+        let message = skipped_folders_toast_message(&[], &["my-project".into()])
+            .expect("should produce a message");
+        assert_eq!(
+            message,
+            "my-project is not a git repository. Included as-is without creating a worktree."
+        );
+    }
+
+    #[test]
+    fn test_skipped_folders_toast_multiple_non_git() {
+        let message = skipped_folders_toast_message(&[], &["foo".into(), "bar".into()])
+            .expect("should produce a message");
+        assert_eq!(
+            message,
+            "foo, bar are not git repositories. Included as-is without creating a worktree."
+        );
+    }
+
+    #[test]
+    fn test_skipped_folders_toast_untrusted_and_non_git() {
+        let message = skipped_folders_toast_message(&["roc".into()], &["my-notes".into()])
+            .expect("should produce a message");
+        assert_eq!(
+            message,
+            "roc is not trusted, and my-notes is not a git repository. Included as-is without creating a worktree."
+        );
+    }
+
+    #[test]
+    fn test_skipped_folders_toast_multiple_untrusted_and_multiple_non_git() {
+        let message = skipped_folders_toast_message(
+            &["roc".into(), "basic-cli".into()],
+            &["docs".into(), "notes".into()],
+        )
+        .expect("should produce a message");
+        assert_eq!(
+            message,
+            "roc, basic-cli are not trusted, and docs, notes are not git repositories. Included as-is without creating a worktree."
+        );
+    }
+
+    #[test]
+    fn test_skipped_folders_toast_none() {
+        assert!(
+            skipped_folders_toast_message(&[], &[]).is_none(),
+            "should return None when there are no skipped folders"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_worktree_creation_no_git_repos(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            cx.update_flags(
+                true,
+                vec!["agent-v2".to_string(), "agent-git-worktrees".to_string()],
+            );
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/project",
+            json!({
+                "src": { "main.rs": "fn main() {}" }
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |mw, _cx| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+        cx.run_until_parked();
+
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let text_thread_store = cx.new(|cx| TextThreadStore::fake(project.clone(), cx));
+            let panel =
+                cx.new(|cx| AgentPanel::new(workspace, text_thread_store, None, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+        cx.run_until_parked();
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.handle_worktree_creation_requested("hello".into(), window, cx);
+        });
+
+        panel.read_with(cx, |panel, _cx| match &panel.worktree_creation_status {
+            Some(WorktreeCreationStatus::Error(msg)) => {
+                assert_eq!(msg.as_ref(), "No git repositories found in the project");
+            }
+            other => panic!("expected Error status, got {other:?}"),
+        });
+    }
+
+    #[gpui::test]
+    async fn test_worktree_creation_classifies_untrusted_folders(cx: &mut TestAppContext) {
+        use project::trusted_worktrees::{self, DbTrustedPaths, PathTrust, TrustedWorktrees};
+
+        init_test(cx);
+        cx.update(|cx| {
+            cx.update_flags(
+                true,
+                vec!["agent-v2".to_string(), "agent-git-worktrees".to_string()],
+            );
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/trusted-repo",
+            json!({
+                ".git": {},
+                "src": { "main.rs": "fn main() {}" }
+            }),
+        )
+        .await;
+        fs.set_branch_name(Path::new("/trusted-repo/.git"), Some("main"));
+        fs.insert_tree(
+            "/untrusted-repo",
+            json!({
+                ".git": {},
+                "src": { "lib.rs": "" }
+            }),
+        )
+        .await;
+        fs.set_branch_name(Path::new("/untrusted-repo/.git"), Some("main"));
+
+        let project = Project::test_with_worktree_trust(
+            fs.clone(),
+            [Path::new("/trusted-repo"), Path::new("/untrusted-repo")],
+            cx,
+        )
+        .await;
+
+        let worktree_store = project.read_with(cx, |project, _| project.worktree_store());
+
+        // Initialize trust tracking and get the worktree IDs.
+        let trusted_worktrees = cx.update(|cx| {
+            trusted_worktrees::init(DbTrustedPaths::default(), cx);
+            trusted_worktrees::track_worktree_trust(worktree_store.clone(), None, None, None, cx);
+            TrustedWorktrees::try_get_global(cx).unwrap()
+        });
+
+        let (trusted_wt_id, untrusted_wt_id) = worktree_store.read_with(cx, |store, cx| {
+            let mut trusted_id = None;
+            let mut untrusted_id = None;
+            for worktree in store.worktrees() {
+                let wt = worktree.read(cx);
+                if wt.abs_path().ends_with("trusted-repo") {
+                    trusted_id = Some(wt.id());
+                } else if wt.abs_path().ends_with("untrusted-repo") {
+                    untrusted_id = Some(wt.id());
+                }
+            }
+            (trusted_id.unwrap(), untrusted_id.unwrap())
+        });
+
+        // Trust the first worktree, leave the second restricted.
+        trusted_worktrees.update(cx, |trusted_worktrees, cx| {
+            // Call can_trust to register both as restricted first.
+            trusted_worktrees.can_trust(&worktree_store, trusted_wt_id, cx);
+            trusted_worktrees.can_trust(&worktree_store, untrusted_wt_id, cx);
+            // Now trust only the first one.
+            trusted_worktrees.trust(
+                &worktree_store,
+                collections::HashSet::from_iter([PathTrust::Worktree(trusted_wt_id)]),
+                cx,
+            );
+        });
+
+        // Wait for git repo discovery on the trusted worktree.
+        cx.run_until_parked();
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |mw, _cx| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+        cx.run_until_parked();
+
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let text_thread_store = cx.new(|cx| TextThreadStore::fake(project.clone(), cx));
+            let panel =
+                cx.new(|cx| AgentPanel::new(workspace, text_thread_store, None, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+        cx.run_until_parked();
+
+        // Trigger worktree creation. The untrusted repo won't have its
+        // git repository discovered, so it should be classified as untrusted.
+        panel.update_in(cx, |panel, window, cx| {
+            panel.handle_worktree_creation_requested("hello".into(), window, cx);
+        });
+
+        // The creation should be in progress (not an error), because the
+        // trusted repo does have a git repository.
+        panel.read_with(cx, |panel, _cx| {
+            assert!(
+                matches!(
+                    panel.worktree_creation_status,
+                    Some(WorktreeCreationStatus::Creating)
+                ),
+                "should be creating, not {:?}",
+                panel.worktree_creation_status,
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_worktree_creation_classifies_non_git_folders(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            cx.update_flags(
+                true,
+                vec!["agent-v2".to_string(), "agent-git-worktrees".to_string()],
+            );
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/git-project",
+            json!({
+                ".git": {},
+                "src": { "main.rs": "fn main() {}" }
+            }),
+        )
+        .await;
+        fs.set_branch_name(Path::new("/git-project/.git"), Some("main"));
+        fs.insert_tree(
+            "/plain-folder",
+            json!({
+                "notes.txt": "hello"
+            }),
+        )
+        .await;
+
+        let project = Project::test(
+            fs.clone(),
+            [Path::new("/git-project"), Path::new("/plain-folder")],
+            cx,
+        )
+        .await;
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |mw, _cx| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+        cx.run_until_parked();
+
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let text_thread_store = cx.new(|cx| TextThreadStore::fake(project.clone(), cx));
+            let panel =
+                cx.new(|cx| AgentPanel::new(workspace, text_thread_store, None, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+        cx.run_until_parked();
+
+        // Trigger worktree creation.
+        panel.update_in(cx, |panel, window, cx| {
+            panel.handle_worktree_creation_requested("hello".into(), window, cx);
+        });
+
+        // Should proceed to Creating because there is at least one git repo.
+        panel.read_with(cx, |panel, _cx| {
+            assert!(
+                matches!(
+                    panel.worktree_creation_status,
+                    Some(WorktreeCreationStatus::Creating)
+                ),
+                "should be creating, not {:?}",
+                panel.worktree_creation_status,
             );
         });
     }
