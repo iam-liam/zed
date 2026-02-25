@@ -678,16 +678,16 @@ impl TerminalPanel {
     fn detach_terminal(
         workspace: &mut Workspace,
         _: &DetachTerminal,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
         let Some(terminal_panel) = workspace.panel::<Self>(cx) else {
             return;
         };
 
-        let terminal_panel = terminal_panel.read(cx);
-        let Some(terminal_view) = terminal_panel
-            .active_pane
+        let terminal_panel_ref = terminal_panel.read(cx);
+        let active_pane = terminal_panel_ref.active_pane.clone();
+        let Some(terminal_view) = active_pane
             .read(cx)
             .active_item()
             .and_then(|item| item.downcast::<TerminalView>())
@@ -695,12 +695,19 @@ impl TerminalPanel {
             return;
         };
 
+        let terminal_view_id = terminal_view.entity_id();
         let title = terminal_view
             .read(cx)
             .terminal()
             .read(cx)
             .breadcrumb_text
             .clone();
+
+        // Remove from dock pane to avoid dual-rendering flicker.
+        // The entity stays alive because we hold a clone for the detached window.
+        active_pane.update(cx, |pane, cx| {
+            pane.remove_item(terminal_view_id, false, false, window, cx);
+        });
 
         let window_size = gpui::Size {
             width: px(800.0),

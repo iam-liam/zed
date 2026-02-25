@@ -1,10 +1,15 @@
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, IntoElement, ParentElement, Render, Styled,
-    Window,
+    Window, px,
 };
 use ui::prelude::*;
 
 use crate::TerminalView;
+
+// Content insets for the detached window. Top clears the traffic lights
+// (will be replaced by a tab bar in the future). Sides provide breathing room.
+const CONTENT_PADDING_TOP: f32 = 38.0;
+const CONTENT_PADDING_SIDE: f32 = 8.0;
 
 pub struct DetachedTerminalWindow {
     terminal_view: Entity<TerminalView>,
@@ -33,6 +38,8 @@ impl Render for DetachedTerminalWindow {
         div()
             .id("detached-terminal-window")
             .size_full()
+            .pt(px(CONTENT_PADDING_TOP))
+            .px(px(CONTENT_PADDING_SIDE))
             .bg(cx.theme().colors().editor_background)
             .child(self.terminal_view.clone())
     }
