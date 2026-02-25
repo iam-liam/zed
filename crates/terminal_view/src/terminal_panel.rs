@@ -48,7 +48,9 @@ actions!(
         /// Toggles the terminal panel.
         Toggle,
         /// Toggles focus on the terminal panel.
-        ToggleFocus
+        ToggleFocus,
+        /// Detaches the active terminal into a standalone window.
+        DetachTerminal
     ]
 );
 
@@ -62,6 +64,7 @@ pub fn init(cx: &mut App) {
                     workspace.toggle_panel_focus::<TerminalPanel>(window, cx);
                 }
             });
+            workspace.register_action(TerminalPanel::detach_terminal);
             workspace.register_action(|workspace, _: &Toggle, window, cx| {
                 if is_enabled_in_workspace(workspace, cx) {
                     if !workspace.toggle_panel_focus::<TerminalPanel>(window, cx) {
@@ -670,6 +673,66 @@ impl TerminalPanel {
                 }
             })
             .detach_and_log_err(cx);
+    }
+
+    fn detach_terminal(
+        workspace: &mut Workspace,
+        _: &DetachTerminal,
+        _window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let Some(terminal_panel) = workspace.panel::<Self>(cx) else {
+            return;
+        };
+
+        let terminal_panel = terminal_panel.read(cx);
+        let Some(terminal_view) = terminal_panel
+            .active_pane
+            .read(cx)
+            .active_item()
+            .and_then(|item| item.downcast::<TerminalView>())
+        else {
+            return;
+        };
+
+        let title = terminal_view
+            .read(cx)
+            .terminal()
+            .read(cx)
+            .breadcrumb_text
+            .clone();
+
+        let window_size = gpui::Size {
+            width: px(800.0),
+            height: px(600.0),
+        };
+        let window_min_size = gpui::Size {
+            width: px(200.0),
+            height: px(100.0),
+        };
+        let window_bounds = gpui::WindowBounds::centered(window_size, cx);
+        let window_background = cx.theme().window_background_appearance();
+
+        cx.open_window(
+            gpui::WindowOptions {
+                titlebar: Some(gpui::TitlebarOptions {
+                    title: Some(format!("Terminal — {title}").into()),
+                    appears_transparent: true,
+                    traffic_light_position: Some(gpui::point(px(12.0), px(12.0))),
+                }),
+                window_bounds: Some(window_bounds),
+                window_min_size: Some(window_min_size),
+                window_background,
+                window_decorations: Some(gpui::WindowDecorations::Client),
+                ..Default::default()
+            },
+            |_window, cx| {
+                cx.new(|cx| {
+                    crate::detached_terminal::DetachedTerminalWindow::new(terminal_view, cx)
+                })
+            },
+        )
+        .log_err();
     }
 
     fn terminals_for_task(

@@ -53,3 +53,24 @@ crates/docs_preprocessor/actions.json
 # Local documentation audit files
 /december-2025-releases.md
 /docs/december-2025-documentation-gaps.md
+
+# Local ae-sys / Claude Code tooling (do not push upstream)
+.ae.toml
+.ae-xtr.toml
+.ae_log/
+.claude/settings.json
+.claude/settings.local.json
+.claude/hooks/
+.claude/skills/
+.claude/agents/
+.claude/tasks/
+.claude/docs/
+.claude/commands/
+.claude/handover/
+.claude/plans/
+.claude/assets/
+.claude/agent-memory/
+CLAUDE.md
+CLAUDE.local.md
+.mcp.json
+.symbol_cache.*
