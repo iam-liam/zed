@@ -2122,7 +2122,6 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        use git::repository::validate_worktree_directory;
         use project::project_settings::ProjectSettings;
         use rand::Rng as _;
         use settings::Settings as _;
@@ -2200,9 +2199,7 @@ impl AgentPanel {
 
         for repo in &git_repos {
             let result = repo.update(cx, |repo, _cx| {
-                let original_repo = repo.original_repo_abs_path.clone();
-                let directory =
-                    validate_worktree_directory(&original_repo, &worktree_directory_setting)?;
+                let directory = repo.validate_worktree_directory(&worktree_directory_setting)?;
                 let new_path = directory.join(&branch_name);
                 let receiver = repo.create_worktree(branch_name.clone(), directory, None);
                 let work_dir = repo.work_directory_abs_path.clone();

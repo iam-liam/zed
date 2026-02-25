@@ -5576,6 +5576,13 @@ impl Repository {
         })
     }
 
+    pub fn validate_worktree_directory(&self, worktree_directory_setting: &str) -> Result<PathBuf> {
+        git::repository::validate_worktree_directory(
+            &self.original_repo_abs_path,
+            worktree_directory_setting,
+        )
+    }
+
     pub fn create_worktree(
         &mut self,
         name: String,
