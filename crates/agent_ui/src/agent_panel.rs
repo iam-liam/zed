@@ -2096,7 +2096,9 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) {
         if self.thread_target == ThreadTarget::NewWorktree {
-            self.handle_worktree_creation_requested(text, window, cx);
+            cx.defer_in(window, move |this, window, cx| {
+                this.handle_worktree_creation_requested(text, window, cx);
+            });
         } else {
             cx.defer_in(window, move |_this, window, cx| {
                 thread_view.update(cx, |thread_view, cx| {
