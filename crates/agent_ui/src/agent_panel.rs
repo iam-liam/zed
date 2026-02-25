@@ -2113,6 +2113,7 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) {
         use project::project_settings::ProjectSettings;
+        use project::trusted_worktrees::TrustedWorktrees;
         use rand::Rng as _;
         use settings::Settings as _;
 
@@ -2146,11 +2147,26 @@ impl AgentPanel {
         let project = &self.project;
         let repositories = project.read(cx).repositories(cx).clone();
         let mut git_repos: Vec<Entity<project::git_store::Repository>> = Vec::new();
+        let mut untrusted_names: Vec<String> = Vec::new();
+        let mut non_git_names: Vec<String> = Vec::new();
         let mut non_git_paths: Vec<PathBuf> = Vec::new();
         let mut seen_repo_ids = std::collections::HashSet::new();
 
+        let worktree_store = project.read(cx).worktree_store();
+        let restricted_worktree_ids: std::collections::HashSet<_> =
+            TrustedWorktrees::try_get_global(cx)
+                .map(|tw| {
+                    tw.read(cx)
+                        .restricted_worktrees(&worktree_store, cx)
+                        .into_iter()
+                        .map(|(id, _)| id)
+                        .collect()
+                })
+                .unwrap_or_default();
+
         for worktree in project.read(cx).visible_worktrees(cx) {
             let wt_path = worktree.read(cx).abs_path();
+            let wt_id = worktree.read(cx).id();
             let matching_repo = repositories.iter().find(|(_, repo)| {
                 let work_dir = &repo.read(cx).work_directory_abs_path;
                 wt_path.starts_with(work_dir.as_ref()) || work_dir.starts_with(wt_path.as_ref())
@@ -2161,6 +2177,16 @@ impl AgentPanel {
                     git_repos.push(repo.clone());
                 }
             } else {
+                let folder_name = wt_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| wt_path.to_string_lossy().into_owned());
+
+                if restricted_worktree_ids.contains(&wt_id) {
+                    untrusted_names.push(folder_name);
+                } else {
+                    non_git_names.push(folder_name);
+                }
                 non_git_paths.push(wt_path.to_path_buf());
             }
         }
@@ -2283,7 +2309,7 @@ impl AgentPanel {
             let setup_result: Result<()> = async {
                 let mut all_paths = created_paths;
                 let has_non_git = !non_git_paths.is_empty();
-                all_paths.extend(non_git_paths.iter().cloned());
+                all_paths.extend(non_git_paths.into_iter());
 
                 let workspace = workspace
                     .upgrade()
@@ -2323,16 +2349,33 @@ impl AgentPanel {
                 new_window_handle.update(cx, |_multi_workspace, window, cx| {
                     new_workspace.update(cx, |workspace, cx| {
                         if has_non_git {
-                            let toast_id =
-                                workspace::notifications::NotificationId::unique::<AgentPanel>();
-                            workspace.show_toast(
-                                workspace::Toast::new(
-                                    toast_id,
-                                    "Some project folders are not git repositories. \
-                                         They were included as-is without creating a worktree.",
-                                ),
-                                cx,
-                            );
+                            let mut parts: Vec<String> = Vec::new();
+                            if !untrusted_names.is_empty() {
+                                let names = untrusted_names.join(", ");
+                                if untrusted_names.len() == 1 {
+                                    parts.push(format!("{names} is not trusted"));
+                                } else {
+                                    parts.push(format!("{names} are not trusted"));
+                                }
+                            }
+                            if !non_git_names.is_empty() {
+                                let names = non_git_names.join(", ");
+                                if non_git_names.len() == 1 {
+                                    parts.push(format!("{names} is not a git repository"));
+                                } else {
+                                    parts.push(format!("{names} are not git repositories"));
+                                }
+                            }
+                            if !parts.is_empty() {
+                                let message = format!(
+                                    "{}. Included as-is without creating a worktree.",
+                                    parts.join(", and "),
+                                );
+                                let toast_id = workspace::notifications::NotificationId::unique::<
+                                    AgentPanel,
+                                >();
+                                workspace.show_toast(workspace::Toast::new(toast_id, message), cx);
+                            }
                         }
 
                         let remapped_paths: Vec<PathBuf> = open_file_paths
