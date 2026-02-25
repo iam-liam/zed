@@ -3,12 +3,11 @@ use gpui::{
     Styled, Window, actions, px,
 };
 use ui::utils::TRAFFIC_LIGHT_PADDING;
-use ui::{IconButton, IconName, IconSize, Tooltip, prelude::*};
+use ui::{IconButton, IconName, IconSize, Tab, Tooltip, prelude::*};
 
 use crate::TerminalView;
 
-const CONTENT_PADDING_SIDE: f32 = 8.0;
-const TAB_BAR_HEIGHT: f32 = 36.0;
+const CONTENT_PADDING_TOP: f32 = 4.0;
 
 actions!(
     detached_terminal,
@@ -70,25 +69,23 @@ impl DetachedTerminalWindow {
 
         h_flex()
             .id("detached-tab-bar")
-            .h(px(TAB_BAR_HEIGHT))
+            .h(Tab::container_height(cx))
             .w_full()
-            .px(px(CONTENT_PADDING_SIDE))
+            .px(DynamicSpacing::Base06.rems(cx))
             .items_center()
             .justify_between()
             .bg(cx.theme().colors().tab_bar_background)
             .border_b_1()
             .border_color(cx.theme().colors().border)
             .child(
-                h_flex().gap_2().ml(px(TRAFFIC_LIGHT_PADDING)).child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().colors().text)
-                        .child(SharedString::from(title)),
-                ),
+                h_flex()
+                    .gap(DynamicSpacing::Base04.rems(cx))
+                    .ml(px(TRAFFIC_LIGHT_PADDING))
+                    .child(Label::new(title).size(LabelSize::Small).color(Color::Muted)),
             )
             .child(
                 h_flex()
-                    .gap_1()
+                    .gap(DynamicSpacing::Base04.rems(cx))
                     .child(
                         IconButton::new("reattach", IconName::Return)
                             .icon_size(IconSize::Small)
@@ -129,7 +126,8 @@ impl Render for DetachedTerminalWindow {
                 div()
                     .flex_1()
                     .min_h_0()
-                    .px(px(CONTENT_PADDING_SIDE))
+                    .pt(px(CONTENT_PADDING_TOP))
+                    .px(DynamicSpacing::Base06.rems(cx))
                     .child(self.terminal_view.clone()),
             )
     }
