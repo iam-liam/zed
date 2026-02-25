@@ -13,7 +13,7 @@ use futures::{channel::oneshot, future::join_all};
 use gpui::{
     Action, AnyView, App, AsyncApp, AsyncWindowContext, Context, Corner, Entity, EventEmitter,
     ExternalPaths, FocusHandle, Focusable, IntoElement, ParentElement, Pixels, Render, Styled,
-    Task, WeakEntity, Window, actions,
+    Task, WeakEntity, Window, WindowHandle, actions,
 };
 use itertools::Itertools;
 use project::{Fs, Project, ProjectEntryId};
@@ -41,6 +41,24 @@ use anyhow::{Result, anyhow};
 use zed_actions::assistant::InlineAssist;
 
 const TERMINAL_PANEL_KEY: &str = "TerminalPanel";
+
+fn detached_window_size() -> gpui::Size<Pixels> {
+    gpui::Size {
+        width: px(800.0),
+        height: px(600.0),
+    }
+}
+
+fn detached_window_min_size() -> gpui::Size<Pixels> {
+    gpui::Size {
+        width: px(200.0),
+        height: px(100.0),
+    }
+}
+
+fn detached_traffic_light_position() -> gpui::Point<Pixels> {
+    gpui::point(px(12.0), px(12.0))
+}
 
 actions!(
     terminal_panel,
@@ -87,6 +105,7 @@ pub struct TerminalPanel {
     pending_serialization: Task<Option<()>>,
     pending_terminals_to_add: usize,
     deferred_tasks: HashMap<TaskId, Task<()>>,
+    detached_windows: Vec<WindowHandle<crate::detached_terminal::DetachedTerminalWindow>>,
     assistant_enabled: bool,
     assistant_tab_bar_button: Option<AnyView>,
     active: bool,
@@ -107,11 +126,22 @@ impl TerminalPanel {
             height: None,
             pending_terminals_to_add: 0,
             deferred_tasks: HashMap::default(),
+            detached_windows: Vec::new(),
             assistant_enabled: false,
             assistant_tab_bar_button: None,
             active: false,
         };
         terminal_panel.apply_tab_bar_buttons(&terminal_panel.active_pane, cx);
+
+        cx.on_release(|this, cx| {
+            for window_handle in &this.detached_windows {
+                window_handle
+                    .update(cx, |_, window, _| window.remove_window())
+                    .ok();
+            }
+        })
+        .detach();
+
         terminal_panel
     }
 
@@ -685,8 +715,7 @@ impl TerminalPanel {
             return;
         };
 
-        let terminal_panel_ref = terminal_panel.read(cx);
-        let active_pane = terminal_panel_ref.active_pane.clone();
+        let active_pane = terminal_panel.read(cx).active_pane.clone();
         let Some(terminal_view) = active_pane
             .read(cx)
             .active_item()
@@ -709,37 +738,136 @@ impl TerminalPanel {
             pane.remove_item(terminal_view_id, false, false, window, cx);
         });
 
-        let window_size = gpui::Size {
-            width: px(800.0),
-            height: px(600.0),
-        };
-        let window_min_size = gpui::Size {
-            width: px(200.0),
-            height: px(100.0),
-        };
-        let window_bounds = gpui::WindowBounds::centered(window_size, cx);
+        // If the dock pane is now empty, hide the dock panel.
+        let all_panes_empty = terminal_panel
+            .read(cx)
+            .center
+            .panes()
+            .iter()
+            .all(|pane| pane.read(cx).items().count() == 0);
+        if all_panes_empty {
+            workspace.close_panel::<Self>(window, cx);
+        }
+
+        let current_display_id = window.display(cx).map(|d| d.id());
+        let window_bounds = gpui::WindowBounds::Windowed(gpui::Bounds::centered(
+            current_display_id,
+            detached_window_size(),
+            cx,
+        ));
         let window_background = cx.theme().window_background_appearance();
 
-        cx.open_window(
-            gpui::WindowOptions {
-                titlebar: Some(gpui::TitlebarOptions {
-                    title: Some(format!("Terminal — {title}").into()),
-                    appears_transparent: true,
-                    traffic_light_position: Some(gpui::point(px(12.0), px(12.0))),
-                }),
-                window_bounds: Some(window_bounds),
-                window_min_size: Some(window_min_size),
-                window_background,
-                window_decorations: Some(gpui::WindowDecorations::Client),
-                ..Default::default()
-            },
-            |_window, cx| {
-                cx.new(|cx| {
-                    crate::detached_terminal::DetachedTerminalWindow::new(terminal_view, cx)
-                })
-            },
-        )
-        .log_err();
+        let Some(detached_handle) = cx
+            .open_window(
+                gpui::WindowOptions {
+                    titlebar: Some(gpui::TitlebarOptions {
+                        title: Some(format!("Terminal — {title}").into()),
+                        appears_transparent: true,
+                        traffic_light_position: Some(detached_traffic_light_position()),
+                    }),
+                    window_bounds: Some(window_bounds),
+                    window_min_size: Some(detached_window_min_size()),
+                    window_background,
+                    display_id: current_display_id,
+                    window_decorations: Some(gpui::WindowDecorations::Client),
+                    ..Default::default()
+                },
+                |_window, cx| {
+                    cx.new(|cx| {
+                        crate::detached_terminal::DetachedTerminalWindow::new(terminal_view, cx)
+                    })
+                },
+            )
+            .log_err()
+        else {
+            return;
+        };
+
+        // Track the detached window and subscribe to its events.
+        terminal_panel.update(cx, |panel, _cx| {
+            panel.detached_windows.push(detached_handle);
+        });
+
+        if let Ok(detached_entity) = detached_handle.entity(cx) {
+            cx.subscribe_in(&detached_entity, window, {
+                let terminal_panel = terminal_panel.downgrade();
+                move |workspace: &mut Workspace,
+                      _detached,
+                      event: &crate::detached_terminal::DetachedTerminalEvent,
+                      window,
+                      cx| {
+                    Self::handle_detached_event(
+                        workspace,
+                        &terminal_panel,
+                        detached_handle,
+                        event,
+                        window,
+                        cx,
+                    );
+                }
+            })
+            .detach();
+
+            // Clean up tracking when the detached window entity is released
+            // (e.g. user clicks OS close button).
+            cx.observe_release(&detached_entity, {
+                let terminal_panel = terminal_panel.downgrade();
+                move |_workspace, _detached_window, cx| {
+                    if let Some(terminal_panel) = terminal_panel.upgrade() {
+                        terminal_panel.update(cx, |panel, _cx| {
+                            panel.detached_windows.retain(|h| h != &detached_handle);
+                        });
+                    }
+                }
+            })
+            .detach();
+        }
+    }
+
+    fn handle_detached_event(
+        workspace: &mut Workspace,
+        terminal_panel: &WeakEntity<Self>,
+        detached_handle: WindowHandle<crate::detached_terminal::DetachedTerminalWindow>,
+        event: &crate::detached_terminal::DetachedTerminalEvent,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        use crate::detached_terminal::DetachedTerminalEvent;
+
+        match event {
+            DetachedTerminalEvent::ReattachRequested { terminal_view } => {
+                if let Some(terminal_panel) = terminal_panel.upgrade() {
+                    let pane = terminal_panel.read(cx).active_pane.clone();
+                    pane.update(cx, |pane, cx| {
+                        pane.add_item(
+                            Box::new(terminal_view.clone()),
+                            true,
+                            true,
+                            None,
+                            window,
+                            cx,
+                        );
+                    });
+                    workspace.open_panel::<Self>(window, cx);
+
+                    terminal_panel.update(cx, |panel, _cx| {
+                        panel.detached_windows.retain(|h| h != &detached_handle);
+                    });
+
+                    // Close the detached window after reattaching.
+                    detached_handle
+                        .update(cx, |_, window, _| window.remove_window())
+                        .ok();
+                }
+            }
+            DetachedTerminalEvent::Closed { .. } => {
+                if let Some(terminal_panel) = terminal_panel.upgrade() {
+                    terminal_panel.update(cx, |panel, _cx| {
+                        panel.detached_windows.retain(|h| h != &detached_handle);
+                    });
+                }
+            }
+        }
     }
 
     fn terminals_for_task(
