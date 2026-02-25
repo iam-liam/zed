@@ -2309,7 +2309,7 @@ impl AgentPanel {
             let setup_result: Result<()> = async {
                 let mut all_paths = created_paths;
                 let has_non_git = !non_git_paths.is_empty();
-                all_paths.extend(non_git_paths.into_iter());
+                all_paths.extend(non_git_paths.iter().cloned());
 
                 let workspace = workspace
                     .upgrade()
