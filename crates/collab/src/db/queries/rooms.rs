@@ -798,6 +798,7 @@ impl Database {
                             stash_entries: Vec::new(),
                             remote_upstream_url: db_repository.remote_upstream_url.clone(),
                             remote_origin_url: db_repository.remote_origin_url.clone(),
+                            original_repo_abs_path: None,
                         });
                     }
                 }
