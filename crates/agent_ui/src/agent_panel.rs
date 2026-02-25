@@ -2096,9 +2096,7 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) {
         if self.thread_target == ThreadTarget::NewWorktree {
-            cx.defer_in(window, move |this, window, cx| {
-                this.handle_worktree_creation_requested(text, window, cx);
-            });
+            self.handle_worktree_creation_requested(text, window, cx);
         } else {
             cx.defer_in(window, move |_this, window, cx| {
                 thread_view.update(cx, |thread_view, cx| {
@@ -2213,22 +2211,28 @@ impl AgentPanel {
             }
         }
 
-        let (dock_structure, open_file_paths) = self
-            .workspace
-            .upgrade()
-            .map(|workspace| {
-                let dock_structure = workspace.read(cx).capture_dock_state(window, cx);
-                let open_file_paths = workspace.read(cx).open_item_abs_paths(cx);
-                (dock_structure, open_file_paths)
-            })
-            .unwrap_or_default();
-
         let workspace = self.workspace.clone();
         let window_handle = window
             .window_handle()
             .downcast::<workspace::MultiWorkspace>();
 
         let task = cx.spawn_in(window, async move |this, cx| {
+            // Capture dock state and open file paths outside the entity update
+            // to avoid a double-borrow panic (capture_dock_state reads all dock
+            // panels, including AgentPanel itself).
+            let (dock_structure, open_file_paths) = cx
+                .update(|window, cx| {
+                    workspace
+                        .upgrade()
+                        .map(|workspace| {
+                            let dock_structure = workspace.read(cx).capture_dock_state(window, cx);
+                            let open_file_paths = workspace.read(cx).open_item_abs_paths(cx);
+                            (dock_structure, open_file_paths)
+                        })
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
+
             // Await all worktree creation results
             let mut results = Vec::new();
             for (repo, new_path, receiver) in creation_infos {
