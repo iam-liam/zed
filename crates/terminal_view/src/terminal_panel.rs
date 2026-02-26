@@ -13,7 +13,7 @@ use futures::{channel::oneshot, future::join_all};
 use gpui::{
     Action, AnyView, App, AsyncApp, AsyncWindowContext, Context, Corner, Entity, EventEmitter,
     ExternalPaths, FocusHandle, Focusable, IntoElement, ParentElement, Pixels, Render, Styled,
-    Task, WeakEntity, Window, actions,
+    Task, WeakEntity, Window, WindowHandle, actions,
 };
 use itertools::Itertools;
 use project::{Fs, Project, ProjectEntryId};
@@ -42,13 +42,36 @@ use zed_actions::assistant::InlineAssist;
 
 const TERMINAL_PANEL_KEY: &str = "TerminalPanel";
 
+fn detached_window_size() -> gpui::Size<Pixels> {
+    gpui::Size {
+        width: px(800.0),
+        height: px(600.0),
+    }
+}
+
+fn detached_window_min_size() -> gpui::Size<Pixels> {
+    gpui::Size {
+        width: px(200.0),
+        height: px(100.0),
+    }
+}
+
+// Matches the main Zed window (zed.rs) at px(9.0) so that
+// TRAFFIC_LIGHT_PADDING leaves the correct gap after the buttons.
+// Secondary windows (settings, rules_library) use px(12.0) instead.
+fn detached_traffic_light_position() -> gpui::Point<Pixels> {
+    gpui::point(px(9.0), px(9.0))
+}
+
 actions!(
     terminal_panel,
     [
         /// Toggles the terminal panel.
         Toggle,
         /// Toggles focus on the terminal panel.
-        ToggleFocus
+        ToggleFocus,
+        /// Detaches the active terminal into a standalone window.
+        DetachTerminal
     ]
 );
 
@@ -62,6 +85,7 @@ pub fn init(cx: &mut App) {
                     workspace.toggle_panel_focus::<TerminalPanel>(window, cx);
                 }
             });
+            workspace.register_action(TerminalPanel::detach_terminal);
             workspace.register_action(|workspace, _: &Toggle, window, cx| {
                 if is_enabled_in_workspace(workspace, cx) {
                     if !workspace.toggle_panel_focus::<TerminalPanel>(window, cx) {
@@ -84,6 +108,7 @@ pub struct TerminalPanel {
     pending_serialization: Task<Option<()>>,
     pending_terminals_to_add: usize,
     deferred_tasks: HashMap<TaskId, Task<()>>,
+    detached_windows: Vec<WindowHandle<crate::detached_terminal::DetachedTerminalWindow>>,
     assistant_enabled: bool,
     assistant_tab_bar_button: Option<AnyView>,
     active: bool,
@@ -104,11 +129,22 @@ impl TerminalPanel {
             height: None,
             pending_terminals_to_add: 0,
             deferred_tasks: HashMap::default(),
+            detached_windows: Vec::new(),
             assistant_enabled: false,
             assistant_tab_bar_button: None,
             active: false,
         };
         terminal_panel.apply_tab_bar_buttons(&terminal_panel.active_pane, cx);
+
+        cx.on_release(|this, cx| {
+            for window_handle in &this.detached_windows {
+                window_handle
+                    .update(cx, |_, window, _| window.remove_window())
+                    .ok();
+            }
+        })
+        .detach();
+
         terminal_panel
     }
 
@@ -670,6 +706,159 @@ impl TerminalPanel {
                 }
             })
             .detach_and_log_err(cx);
+    }
+
+    fn detach_terminal(
+        workspace: &mut Workspace,
+        _: &DetachTerminal,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let Some(terminal_panel) = workspace.panel::<Self>(cx) else {
+            return;
+        };
+
+        let active_pane = terminal_panel.read(cx).active_pane.clone();
+        let Some(terminal_view) = active_pane
+            .read(cx)
+            .active_item()
+            .and_then(|item| item.downcast::<TerminalView>())
+        else {
+            return;
+        };
+
+        let terminal_view_id = terminal_view.entity_id();
+        let title = terminal_view.read(cx).terminal().read(cx).title(false);
+
+        // Remove from dock pane to avoid dual-rendering flicker.
+        // The entity stays alive because we hold a clone for the detached window.
+        active_pane.update(cx, |pane, cx| {
+            pane.remove_item(terminal_view_id, false, false, window, cx);
+        });
+
+        // If the dock pane is now empty, hide the dock panel.
+        let all_panes_empty = terminal_panel
+            .read(cx)
+            .center
+            .panes()
+            .iter()
+            .all(|pane| pane.read(cx).items().count() == 0);
+        if all_panes_empty {
+            workspace.close_panel::<Self>(window, cx);
+        }
+
+        let current_display_id = window.display(cx).map(|d| d.id());
+        let window_bounds = gpui::WindowBounds::Windowed(gpui::Bounds::centered(
+            current_display_id,
+            detached_window_size(),
+            cx,
+        ));
+        let window_background = cx.theme().window_background_appearance();
+
+        let Some(detached_handle) = cx
+            .open_window(
+                gpui::WindowOptions {
+                    titlebar: Some(gpui::TitlebarOptions {
+                        title: Some(format!("Terminal — {title}").into()),
+                        appears_transparent: true,
+                        traffic_light_position: Some(detached_traffic_light_position()),
+                    }),
+                    window_bounds: Some(window_bounds),
+                    window_min_size: Some(detached_window_min_size()),
+                    window_background,
+                    display_id: current_display_id,
+                    window_decorations: Some(gpui::WindowDecorations::Client),
+                    ..Default::default()
+                },
+                |_window, cx| {
+                    cx.new(|cx| {
+                        crate::detached_terminal::DetachedTerminalWindow::new(terminal_view, cx)
+                    })
+                },
+            )
+            .log_err()
+        else {
+            return;
+        };
+
+        // Track the detached window and subscribe to its events.
+        terminal_panel.update(cx, |panel, _cx| {
+            panel.detached_windows.push(detached_handle);
+        });
+
+        if let Ok(detached_entity) = detached_handle.entity(cx) {
+            cx.subscribe_in(&detached_entity, window, {
+                let terminal_panel = terminal_panel.downgrade();
+                move |workspace: &mut Workspace,
+                      _detached,
+                      event: &crate::detached_terminal::DetachedTerminalEvent,
+                      window,
+                      cx| {
+                    Self::handle_detached_event(
+                        workspace,
+                        &terminal_panel,
+                        detached_handle,
+                        event,
+                        window,
+                        cx,
+                    );
+                }
+            })
+            .detach();
+
+            // Clean up tracking when the detached window entity is released
+            // (e.g. user clicks OS close button).
+            cx.observe_release(&detached_entity, {
+                let terminal_panel = terminal_panel.downgrade();
+                move |_workspace, _detached_window, cx| {
+                    if let Some(terminal_panel) = terminal_panel.upgrade() {
+                        terminal_panel.update(cx, |panel, _cx| {
+                            panel.detached_windows.retain(|h| h != &detached_handle);
+                        });
+                    }
+                }
+            })
+            .detach();
+        }
+    }
+
+    fn handle_detached_event(
+        workspace: &mut Workspace,
+        terminal_panel: &WeakEntity<Self>,
+        detached_handle: WindowHandle<crate::detached_terminal::DetachedTerminalWindow>,
+        event: &crate::detached_terminal::DetachedTerminalEvent,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        use crate::detached_terminal::DetachedTerminalEvent;
+
+        match event {
+            DetachedTerminalEvent::ReattachRequested { terminal_view } => {
+                if let Some(terminal_panel) = terminal_panel.upgrade() {
+                    let pane = terminal_panel.read(cx).active_pane.clone();
+                    pane.update(cx, |pane, cx| {
+                        pane.add_item(
+                            Box::new(terminal_view.clone()),
+                            true,
+                            true,
+                            None,
+                            window,
+                            cx,
+                        );
+                    });
+                    workspace.open_panel::<Self>(window, cx);
+
+                    terminal_panel.update(cx, |panel, _cx| {
+                        panel.detached_windows.retain(|h| h != &detached_handle);
+                    });
+
+                    // Close the detached window after reattaching.
+                    detached_handle
+                        .update(cx, |_, window, _| window.remove_window())
+                        .ok();
+                }
+            }
+        }
     }
 
     fn terminals_for_task(
@@ -2041,5 +2230,380 @@ mod tests {
             editor::init(cx);
             crate::init(cx);
         });
+    }
+
+    #[gpui::test]
+    async fn test_detached_windows_tracking(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+
+        let terminal_panel = window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    cx.new(|cx| TerminalPanel::new(workspace, window, cx))
+                })
+            })
+            .unwrap();
+
+        // Verify detached_windows initializes empty
+        window_handle
+            .update(cx, |_, _, cx| {
+                terminal_panel.update(cx, |panel, _cx| {
+                    assert_eq!(panel.detached_windows.len(), 0);
+                });
+            })
+            .unwrap();
+
+        // Add a terminal
+        window_handle
+            .update(cx, |_, window, cx| {
+                terminal_panel.update(cx, |panel, cx| {
+                    panel.add_local_terminal_shell(RevealStrategy::Always, window, cx)
+                })
+            })
+            .unwrap()
+            .await
+            .log_err();
+
+        // Verify one terminal in pane
+        window_handle
+            .update(cx, |_, _, cx| {
+                terminal_panel.update(cx, |panel, cx| {
+                    assert_eq!(panel.active_pane.read(cx).items().count(), 1);
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_multiple_terminals_in_pane(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+
+        let terminal_panel = window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    cx.new(|cx| TerminalPanel::new(workspace, window, cx))
+                })
+            })
+            .unwrap();
+
+        // Add two terminals
+        window_handle
+            .update(cx, |_, window, cx| {
+                terminal_panel.update(cx, |panel, cx| {
+                    panel.add_local_terminal_shell(RevealStrategy::Always, window, cx)
+                })
+            })
+            .unwrap()
+            .await
+            .log_err();
+
+        window_handle
+            .update(cx, |_, window, cx| {
+                terminal_panel.update(cx, |panel, cx| {
+                    panel.add_local_terminal_shell(RevealStrategy::Always, window, cx)
+                })
+            })
+            .unwrap()
+            .await
+            .log_err();
+
+        // Verify both terminals exist and active item is a TerminalView
+        window_handle
+            .update(cx, |_, _, cx| {
+                terminal_panel.update(cx, |panel, cx| {
+                    let pane = panel.active_pane.read(cx);
+                    assert_eq!(pane.items().count(), 2);
+                    assert!(
+                        pane.active_item()
+                            .and_then(|item| item.downcast::<TerminalView>())
+                            .is_some(),
+                        "Active item should be a TerminalView"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_detach_removes_terminal_from_pane(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+
+        let terminal_panel = window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    cx.new(|cx| TerminalPanel::new(workspace, window, cx))
+                })
+            })
+            .unwrap();
+
+        // Add two terminals
+        window_handle
+            .update(cx, |_, window, cx| {
+                terminal_panel.update(cx, |panel, cx| {
+                    panel.add_local_terminal_shell(RevealStrategy::Always, window, cx)
+                })
+            })
+            .unwrap()
+            .await
+            .log_err();
+
+        window_handle
+            .update(cx, |_, window, cx| {
+                terminal_panel.update(cx, |panel, cx| {
+                    panel.add_local_terminal_shell(RevealStrategy::Always, window, cx)
+                })
+            })
+            .unwrap()
+            .await
+            .log_err();
+
+        // Grab the active terminal view before detaching
+        let terminal_view = window_handle
+            .update(cx, |_, _, cx| {
+                terminal_panel.update(cx, |panel, cx| {
+                    panel
+                        .active_pane
+                        .read(cx)
+                        .active_item()
+                        .and_then(|item| item.downcast::<TerminalView>())
+                        .expect("Should have an active TerminalView")
+                })
+            })
+            .unwrap();
+
+        let terminal_view_id = terminal_view.entity_id();
+
+        // Simulate what detach_terminal does: remove the item from the pane
+        window_handle
+            .update(cx, |_, window, cx| {
+                terminal_panel.update(cx, |panel, cx| {
+                    panel.active_pane.update(cx, |pane, cx| {
+                        pane.remove_item(terminal_view_id, false, false, window, cx);
+                    });
+                });
+            })
+            .unwrap();
+
+        // Verify the terminal was removed — pane should have 1 item now
+        window_handle
+            .update(cx, |_, _, cx| {
+                terminal_panel.update(cx, |panel, cx| {
+                    assert_eq!(
+                        panel.active_pane.read(cx).items().count(),
+                        1,
+                        "Pane should have one terminal after detaching the other"
+                    );
+                });
+            })
+            .unwrap();
+
+        // Verify the removed terminal view entity is still alive (not dropped)
+        cx.read(|cx| {
+            assert!(
+                terminal_view
+                    .read(cx)
+                    .terminal()
+                    .read(cx)
+                    .title(false)
+                    .len()
+                    > 0,
+                "Detached terminal entity should still be alive and readable"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_detach_last_terminal_empties_pane(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+
+        let terminal_panel = window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    cx.new(|cx| TerminalPanel::new(workspace, window, cx))
+                })
+            })
+            .unwrap();
+
+        // Add one terminal
+        window_handle
+            .update(cx, |_, window, cx| {
+                terminal_panel.update(cx, |panel, cx| {
+                    panel.add_local_terminal_shell(RevealStrategy::Always, window, cx)
+                })
+            })
+            .unwrap()
+            .await
+            .log_err();
+
+        let terminal_view_id = window_handle
+            .update(cx, |_, _, cx| {
+                terminal_panel.update(cx, |panel, cx| {
+                    panel
+                        .active_pane
+                        .read(cx)
+                        .active_item()
+                        .expect("Should have an active item")
+                        .item_id()
+                })
+            })
+            .unwrap();
+
+        // Remove the only terminal (simulates detach)
+        window_handle
+            .update(cx, |_, window, cx| {
+                terminal_panel.update(cx, |panel, cx| {
+                    panel.active_pane.update(cx, |pane, cx| {
+                        pane.remove_item(terminal_view_id, false, false, window, cx);
+                    });
+                });
+            })
+            .unwrap();
+
+        // Verify pane is empty — this is the condition that triggers dock auto-hide
+        window_handle
+            .update(cx, |_, _, cx| {
+                terminal_panel.update(cx, |panel, cx| {
+                    assert_eq!(
+                        panel.active_pane.read(cx).items().count(),
+                        0,
+                        "Pane should be empty after detaching the last terminal"
+                    );
+                    assert!(
+                        panel
+                            .center
+                            .panes()
+                            .iter()
+                            .all(|pane| pane.read(cx).items().count() == 0),
+                        "All panes should be empty — triggers dock auto-hide in detach_terminal"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_reattach_adds_terminal_back_to_pane(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+
+        let terminal_panel = window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    cx.new(|cx| TerminalPanel::new(workspace, window, cx))
+                })
+            })
+            .unwrap();
+
+        // Add a terminal
+        window_handle
+            .update(cx, |_, window, cx| {
+                terminal_panel.update(cx, |panel, cx| {
+                    panel.add_local_terminal_shell(RevealStrategy::Always, window, cx)
+                })
+            })
+            .unwrap()
+            .await
+            .log_err();
+
+        // Grab the terminal view
+        let terminal_view = window_handle
+            .update(cx, |_, _, cx| {
+                terminal_panel.update(cx, |panel, cx| {
+                    panel
+                        .active_pane
+                        .read(cx)
+                        .active_item()
+                        .and_then(|item| item.downcast::<TerminalView>())
+                        .expect("Should have an active TerminalView")
+                })
+            })
+            .unwrap();
+
+        let terminal_view_id = terminal_view.entity_id();
+
+        // Remove from pane (simulates detach)
+        window_handle
+            .update(cx, |_, window, cx| {
+                terminal_panel.update(cx, |panel, cx| {
+                    panel.active_pane.update(cx, |pane, cx| {
+                        pane.remove_item(terminal_view_id, false, false, window, cx);
+                    });
+                });
+            })
+            .unwrap();
+
+        assert_eq!(
+            window_handle
+                .update(cx, |_, _, cx| {
+                    terminal_panel
+                        .update(cx, |panel, cx| panel.active_pane.read(cx).items().count())
+                })
+                .unwrap(),
+            0,
+            "Pane should be empty after removal"
+        );
+
+        // Simulate reattach: add the terminal view back to the pane
+        window_handle
+            .update(cx, |_, window, cx| {
+                terminal_panel.update(cx, |panel, cx| {
+                    panel.active_pane.update(cx, |pane, cx| {
+                        pane.add_item(
+                            Box::new(terminal_view.clone()),
+                            true,
+                            true,
+                            None,
+                            window,
+                            cx,
+                        );
+                    });
+                });
+            })
+            .unwrap();
+
+        // Verify terminal is back in the pane
+        window_handle
+            .update(cx, |_, _, cx| {
+                terminal_panel.update(cx, |panel, cx| {
+                    let pane = panel.active_pane.read(cx);
+                    assert_eq!(pane.items().count(), 1, "Terminal should be back in pane");
+                    assert!(
+                        pane.active_item()
+                            .and_then(|item| item.downcast::<TerminalView>())
+                            .is_some(),
+                        "Reattached item should be a TerminalView"
+                    );
+                });
+            })
+            .unwrap();
     }
 }
