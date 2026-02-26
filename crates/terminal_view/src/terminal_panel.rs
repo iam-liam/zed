@@ -11,9 +11,9 @@ use collections::HashMap;
 use db::kvp::KEY_VALUE_STORE;
 use futures::{channel::oneshot, future::join_all};
 use gpui::{
-    Action, AnyView, App, AsyncApp, AsyncWindowContext, Context, Corner, Entity, EventEmitter,
-    ExternalPaths, FocusHandle, Focusable, IntoElement, ParentElement, Pixels, Render, Styled,
-    Task, WeakEntity, Window, WindowHandle, actions,
+    Action, AnyView, App, AsyncApp, AsyncWindowContext, Context, Corner, DragMoveEvent, Entity,
+    EventEmitter, ExternalPaths, FocusHandle, Focusable, IntoElement, MouseButton, ParentElement,
+    Pixels, Render, Styled, Task, WeakEntity, Window, WindowHandle, actions,
 };
 use itertools::Itertools;
 use project::{Fs, Project, ProjectEntryId};
@@ -109,6 +109,7 @@ pub struct TerminalPanel {
     pending_terminals_to_add: usize,
     deferred_tasks: HashMap<TaskId, Task<()>>,
     detached_windows: Vec<WindowHandle<crate::detached_terminal::DetachedTerminalWindow>>,
+    pending_drag_terminal: Option<Entity<TerminalView>>,
     assistant_enabled: bool,
     assistant_tab_bar_button: Option<AnyView>,
     active: bool,
@@ -130,6 +131,7 @@ impl TerminalPanel {
             pending_terminals_to_add: 0,
             deferred_tasks: HashMap::default(),
             detached_windows: Vec::new(),
+            pending_drag_terminal: None,
             assistant_enabled: false,
             assistant_tab_bar_button: None,
             active: false,
@@ -718,23 +720,59 @@ impl TerminalPanel {
             return;
         };
 
-        let active_pane = terminal_panel.read(cx).active_pane.clone();
-        let Some(terminal_view) = active_pane
-            .read(cx)
-            .active_item()
-            .and_then(|item| item.downcast::<TerminalView>())
-        else {
+        // Check if a specific terminal was queued for detach (e.g. via drag).
+        // Otherwise fall back to the active terminal in the active pane.
+        let pending = terminal_panel.update(cx, |panel, _cx| panel.pending_drag_terminal.take());
+        let terminal_view = pending.or_else(|| {
+            terminal_panel
+                .read(cx)
+                .active_pane
+                .read(cx)
+                .active_item()
+                .and_then(|item| item.downcast::<TerminalView>())
+        });
+
+        let Some(terminal_view) = terminal_view else {
             return;
         };
 
+        Self::detach_terminal_view_in_workspace(
+            workspace,
+            &terminal_panel,
+            terminal_view,
+            window,
+            cx,
+        );
+    }
+
+    fn detach_terminal_view_in_workspace(
+        workspace: &mut Workspace,
+        terminal_panel: &Entity<Self>,
+        terminal_view: Entity<TerminalView>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
         let terminal_view_id = terminal_view.entity_id();
         let title = terminal_view.read(cx).terminal().read(cx).title(false);
 
-        // Remove from dock pane to avoid dual-rendering flicker.
+        // Find which pane contains this terminal and remove it.
         // The entity stays alive because we hold a clone for the detached window.
-        active_pane.update(cx, |pane, cx| {
-            pane.remove_item(terminal_view_id, false, false, window, cx);
-        });
+        let source_pane = terminal_panel
+            .read(cx)
+            .center
+            .panes()
+            .into_iter()
+            .find(|pane| {
+                pane.read(cx)
+                    .items()
+                    .any(|item| item.item_id() == terminal_view_id)
+            })
+            .cloned();
+        if let Some(source_pane) = source_pane {
+            source_pane.update(cx, |pane, cx| {
+                pane.remove_item(terminal_view_id, false, false, window, cx);
+            });
+        }
 
         // If the dock pane is now empty, hide the dock panel.
         let all_panes_empty = terminal_panel
@@ -1826,6 +1864,37 @@ impl Render for TerminalPanel {
                         };
                     },
                 ))
+                .on_drag_move::<DraggedTab>(cx.listener(
+                    |this, event: &DragMoveEvent<DraggedTab>, _, cx| {
+                        let dragged_tab = event.drag(cx);
+                        this.pending_drag_terminal = dragged_tab.item.downcast::<TerminalView>();
+                    },
+                ))
+                .on_mouse_up_out(
+                    MouseButton::Left,
+                    cx.listener(|this, event: &gpui::MouseUpEvent, window, cx| {
+                        let Some(_terminal_view) = this.pending_drag_terminal.take() else {
+                            return;
+                        };
+                        if !cx.has_active_drag() {
+                            return;
+                        }
+                        // Only detach when the mouse is released outside the
+                        // window, not just outside the terminal panel. Drops
+                        // inside the window should use normal tab move behavior.
+                        let viewport = window.viewport_size();
+                        let position = event.position;
+                        if position.x >= gpui::px(0.)
+                            && position.y >= gpui::px(0.)
+                            && position.x <= viewport.width
+                            && position.y <= viewport.height
+                        {
+                            return;
+                        }
+                        cx.stop_active_drag(window);
+                        window.dispatch_action(DetachTerminal.boxed_clone(), cx);
+                    }),
+                )
             })
             .unwrap_or_else(|| div())
     }
