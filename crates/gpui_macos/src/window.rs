@@ -1782,7 +1782,18 @@ unsafe fn get_window_state(object: &Object) -> Arc<Mutex<MacWindowState>> {
 unsafe fn drop_window_state(object: &Object) {
     unsafe {
         let raw: *mut c_void = *object.get_ivar(WINDOW_STATE_IVAR);
-        Arc::from_raw(raw as *mut Mutex<MacWindowState>);
+        let state = Arc::from_raw(raw as *mut Mutex<MacWindowState>);
+        // `CursorStyle::None` is implemented via the global `NSCursor.hide()`,
+        // which maintains a system-wide hide-count. If we drop the window with
+        // `cursor_hidden = true` (e.g. when a window opened over a hidden
+        // cursor is closed before the cursor is unhidden), the count is left
+        // unbalanced and the cursor stays invisible across the whole app
+        // until something else calls `unhide`. Balance the count here.
+        let mut state_lock = state.lock();
+        if state_lock.cursor_hidden {
+            let _: () = msg_send![class!(NSCursor), unhide];
+            state_lock.cursor_hidden = false;
+        }
     }
 }
 
